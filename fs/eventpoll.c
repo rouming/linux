@@ -2614,6 +2614,14 @@ out_free_ep:
 	return error;
 }
 
+SYSCALL_DEFINE2(epoll_create2, int, flags, size_t, size)
+{
+	if (size == 0)
+		return -EINVAL;
+
+	return do_epoll_create(flags, size);
+}
+
 SYSCALL_DEFINE1(epoll_create1, int, flags)
 {
 	return do_epoll_create(flags, 0);
