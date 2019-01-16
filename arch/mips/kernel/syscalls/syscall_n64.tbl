@@ -349,3 +349,5 @@
 432	n64	fsmount				sys_fsmount
 433	n64	fspick				sys_fspick
 434	n64	pidfd_open			sys_pidfd_open
+# 436	n64	clone3			sys_clone3
+437	n64	epoll_create2			sys_epoll_create2

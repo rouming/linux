@@ -474,3 +474,5 @@
 542	common	fsmount				sys_fsmount
 543	common	fspick				sys_fspick
 544	common	pidfd_open			sys_pidfd_open
+# 546	common	clone3			sys_clone3
+547	common	epoll_create2			sys_epoll_create2
