@@ -890,6 +890,8 @@ __SYSCALL(__NR_fspick, sys_fspick)
 __SYSCALL(__NR_pidfd_open, sys_pidfd_open)
 #define __NR_clone3 436
 __SYSCALL(__NR_clone3, sys_clone3)
+#define __NR_epoll_create2 437
+__SYSCALL(__NR_epoll_create2, sys_epoll_create2)
 
 /*
  * Please add new compat syscalls above this comment and update

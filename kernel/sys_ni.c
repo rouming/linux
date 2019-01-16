@@ -65,6 +65,7 @@ COND_SYSCALL(eventfd2);
 
 /* fs/eventfd.c */
 COND_SYSCALL(epoll_create1);
+COND_SYSCALL(epoll_create2);
 COND_SYSCALL(epoll_ctl);
 COND_SYSCALL(epoll_pwait);
 COND_SYSCALL_COMPAT(epoll_pwait);
