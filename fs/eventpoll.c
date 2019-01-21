@@ -189,6 +189,9 @@ struct epitem {
 
 	/* Work for offloading event callback */
 	struct work_struct work;
+
+	/* Bit in user bitmap for user polling */
+	unsigned int bit;
 };
 
 /*
@@ -425,6 +428,11 @@ static inline unsigned int ep_to_index_length(unsigned int nr)
 static inline unsigned int ep_to_items_bm_length(unsigned int nr)
 {
 	return PAGE_ALIGN(ALIGN(nr, 8) >> 3);
+}
+
+static inline unsigned int ep_max_index_nr(struct eventpoll *ep)
+{
+	return ep->index_length >> ilog2(sizeof(*ep->user_index));
 }
 
 static inline bool ep_polled_by_user(struct eventpoll *ep)
@@ -855,6 +863,127 @@ static void epi_rcu_free(struct rcu_head *head)
 {
 	struct epitem *epi = container_of(head, struct epitem, rcu);
 	kmem_cache_free(epi_cache, epi);
+}
+
+#define atomic_set_unless_zero(ptr, flags)			\
+({								\
+	typeof(ptr) _ptr = (ptr);				\
+	typeof(flags) _flags = (flags);				\
+	typeof(*_ptr) _old, _val = READ_ONCE(*_ptr);		\
+								\
+	for (;;) {						\
+		if (!_val)					\
+			break;					\
+		_old = cmpxchg(_ptr, _val, _flags);		\
+		if (_old == _val)				\
+			break;					\
+		_val = _old;					\
+	}							\
+	_val;							\
+})
+
+static inline void ep_remove_user_item(struct epitem *epi)
+{
+	struct eventpoll *ep = epi->ep;
+	struct epoll_uitem *uitem;
+
+	lockdep_assert_held(&ep->mtx);
+
+	/* Event should not have any attached queues */
+	WARN_ON(!list_empty(&epi->pwqlist));
+
+	uitem = &ep->user_header->items[epi->bit];
+
+	/*
+	 * User item can be in two states: signaled (read_events is set
+	 * and userspace has not yet consumed this event) and not signaled
+	 * (no events yet fired or already consumed by userspace).
+	 * We reset ready_events to EPOLLREMOVED only if ready_events is
+	 * in signaled state (we expect that userspace will come soon and
+	 * fetch this event).  In case of not signaled leave read_events
+	 * as 0.
+	 *
+	 * Why it is important to mark read_events as EPOLLREMOVED in case
+	 * of already signaled state?  ep_insert() op can be immediately
+	 * called after ep_remove(), thus the same bit can be reused and
+	 * then new event comes, which corresponds to the same entry inside
+	 * user items array.  For this particular case ep_add_event_to_uring()
+	 * does not allocate a new index entry, but simply masks EPOLLREMOVED,
+	 * and userspace uses old index entry, but meanwhile old user item
+	 * has been removed, new item has been added and event updated.
+	 */
+	atomic_set_unless_zero(&uitem->ready_events, EPOLLREMOVED);
+	clear_bit(epi->bit, ep->items_bm);
+}
+
+#define atomic_or_with_mask(ptr, flags, mask)			\
+({								\
+	typeof(ptr) _ptr = (ptr);				\
+	typeof(flags) _flags = (flags);				\
+	typeof(flags) _mask = (mask);				\
+	typeof(*_ptr) _old, _new, _val = READ_ONCE(*_ptr);	\
+								\
+	for (;;) {						\
+		_new = (_val & ~_mask) | _flags;		\
+		_old = cmpxchg(_ptr, _val, _new);		\
+		if (_old == _val)				\
+			break;					\
+		_val = _old;					\
+	}							\
+	_val;							\
+})
+
+static inline bool ep_add_event_to_uring(struct epitem *epi, __poll_t pollflags)
+{
+	struct eventpoll *ep = epi->ep;
+	struct epoll_uitem *uitem;
+	bool added = false;
+
+	if (WARN_ON(!pollflags))
+		return false;
+
+	uitem = &ep->user_header->items[epi->bit];
+	/*
+	 * Can be represented as:
+	 *
+	 *    was_ready = uitem->ready_events;
+	 *    uitem->ready_events &= ~EPOLLREMOVED;
+	 *    uitem->ready_events |= pollflags;
+	 *    if (!was_ready) {
+	 *         // create index entry
+	 *    }
+	 *
+	 * See the big comment inside ep_remove_user_item(), why it is
+	 * important to mask EPOLLREMOVED.
+	 */
+	if (!atomic_or_with_mask(&uitem->ready_events,
+				 pollflags, EPOLLREMOVED)) {
+		unsigned int i, *item_idx, index_mask;
+
+		/*
+		 * Item was not ready before, thus we have to insert
+		 * new index to the ring.
+		 */
+
+		index_mask = ep_max_index_nr(ep) - 1;
+		i = __atomic_fetch_add(&ep->user_header->tail, 1,
+				       __ATOMIC_ACQUIRE);
+		item_idx = &ep->user_index[i & index_mask];
+
+		/* Signal with a bit, which is > 0 */
+		*item_idx = epi->bit + 1;
+
+		/*
+		 * Want index update be flushed from CPU write buffer and
+		 * immediately visible on userspace side to avoid long busy
+		 * loops.
+		 */
+		smp_wmb();
+
+		added = true;
+	}
+
+	return added;
 }
 
 /*
