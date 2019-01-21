@@ -79,4 +79,33 @@ struct epoll_event {
 	__u64 data;
 } EPOLL_PACKED;
 
+#define EPOLL_USERPOLL_HEADER_MAGIC 0xeb01eb01
+#define EPOLL_USERPOLL_HEADER_SIZE  128
+
+/*
+ * Item, shared with userspace.  Unfortunately we can't embed epoll_event
+ * structure, because it is badly aligned on all 64-bit archs, except
+ * x86-64 (see EPOLL_PACKED).  sizeof(epoll_uitem) == 16
+ */
+struct epoll_uitem {
+	__poll_t ready_events;
+	__poll_t events;
+	__u64 data;
+};
+
+/*
+ * Header, shared with userspace. sizeof(epoll_uheader) == 128
+ */
+struct epoll_uheader {
+	__u32 magic;          /* epoll user header magic */
+	__u32 header_length;  /* length of the header + items */
+	__u32 index_length;   /* length of the index ring, always pow2 */
+	__u32 max_items_nr;   /* max number of items */
+	__u32 head;           /* updated by userland */
+	__u32 tail;           /* updated by kernel */
+
+	struct epoll_uitem items[]
+		__attribute__((__aligned__(EPOLL_USERPOLL_HEADER_SIZE)));
+};
+
 #endif /* _UAPI_LINUX_EVENTPOLL_H */
