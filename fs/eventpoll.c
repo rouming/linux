@@ -4,6 +4,7 @@
  *  Copyright (C) 2001,...,2009	 Davide Libenzi
  *
  *  Davide Libenzi <davidel@xmailserver.org>
+ *  Polling from userspace support by Roman Penyaev <rpenyaev@suse.de>
  */
 
 #include <linux/init.h>
@@ -103,6 +104,16 @@
 #define EP_UNACTIVE_PTR ((void *) -1L)
 
 #define EP_ITEM_COST (sizeof(struct epitem) + sizeof(struct eppoll_entry))
+
+/*
+ * That is around 1.3mb of allocated memory for one epfd.  What is more
+ * important is ->index_length, which should be ^2, so do not increase
+ * max items number to avoid size doubling of user index.
+ *
+ * Before increasing the value see add_event_to_uring() and especially
+ * cnt_to_advance() functions and change them accordingly.
+ */
+#define EP_USERPOLL_MAX_ITEMS_NR 65536
 
 struct epoll_filefd {
 	struct file *file;
