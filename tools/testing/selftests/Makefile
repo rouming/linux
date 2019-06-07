@@ -52,6 +52,7 @@ TARGETS += timers
 endif
 TARGETS += tmpfs
 TARGETS += tpm2
+TARGETS += uepoll
 TARGETS += user
 TARGETS += vm
 TARGETS += x86
