@@ -222,6 +222,8 @@ struct ceph_msg {
 	struct kvec front;              /* unaligned blobs of message */
 	struct ceph_buffer *middle;
 
+	void (*free_msg)(struct ceph_msg *);
+
 	size_t				data_length;
 	struct ceph_msg_data		*data;
 	int				num_data_items;

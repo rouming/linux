@@ -526,6 +526,10 @@ static void request_init(struct ceph_osd_request *req)
 	/* req only, each op is zeroed in _osd_req_op_init() */
 	memset(req, 0, sizeof(*req));
 
+	refcount_set(&req->r_reps, 0);
+	req->r_orig = NULL;
+	req->r_replicated = false;
+
 	kref_init(&req->r_kref);
 	init_completion(&req->r_completion);
 	RB_CLEAR_NODE(&req->r_node);
@@ -556,6 +560,9 @@ static void request_reinit(struct ceph_osd_request *req)
 	dout("%s req %p\n", __func__, req);
 	WARN_ON(kref_read(&req->r_kref) != 1);
 	request_release_checks(req);
+
+	WARN_ON(refcount_read(&req->r_reps));
+	WARN_ON(req->r_orig);
 
 	WARN_ON(kref_read(&request_msg->kref) != 1);
 	WARN_ON(kref_read(&reply_msg->kref) != 1);
@@ -1550,7 +1557,8 @@ enum calc_target_result {
 
 static enum calc_target_result calc_target(struct ceph_osd_client *osdc,
 					   struct ceph_osd_request_target *t,
-					   bool any_change)
+					   bool any_change,
+					   bool dont_touch_osd)
 {
 	struct ceph_pg_pool_info *pi;
 	struct ceph_pg pgid, last_pgid;
@@ -1657,10 +1665,12 @@ static enum calc_target_result calc_target(struct ceph_osd_client *osdc,
 			} else {
 				pos = pick_closest_replica(osdc, &acting);
 			}
-			t->osd = acting.osds[pos];
+			if (!dont_touch_osd)
+				t->osd = acting.osds[pos];
 			t->used_replica = pos > 0;
 		} else {
-			t->osd = acting.primary;
+			if (!dont_touch_osd)
+				t->osd = acting.primary;
 			t->used_replica = false;
 		}
 	}
@@ -2272,6 +2282,29 @@ static void encode_request_finish(struct ceph_msg *msg)
 	     le16_to_cpu(msg->hdr.version));
 }
 
+static bool osdmap_acting_osds(struct ceph_osd_client *osdc,
+			       struct ceph_osd_request_target *t,
+			       struct ceph_osds *acting)
+{
+	struct ceph_pg_pool_info *pi;
+	struct ceph_osds up;
+	struct ceph_pg pgid;
+	bool ret = false;
+
+	down_read(&osdc->lock);
+	pi = ceph_pg_pool_by_id(osdc->osdmap, t->base_oloc.pool);
+	if (!pi)
+		goto out;
+
+	__ceph_object_locator_to_pg(pi, &t->base_oid, &t->base_oloc, &pgid);
+	ceph_pg_to_up_acting_osds(osdc->osdmap, pi, &pgid, &up, acting);
+	ret = true;
+out:
+	up_read(&osdc->lock);
+
+	return ret;
+}
+
 /*
  * @req has to be assigned a tid and registered.
  */
@@ -2353,7 +2386,7 @@ static void __submit_request(struct ceph_osd_request *req, bool wrlocked)
 	dout("%s req %p wrlocked %d\n", __func__, req, wrlocked);
 
 again:
-	ct_res = calc_target(osdc, &req->r_t, false);
+	ct_res = calc_target(osdc, &req->r_t, false, req->r_replicated);
 	if (ct_res == CALC_TARGET_POOL_DNE && !wrlocked)
 		goto promote;
 
@@ -2446,7 +2479,8 @@ static void account_request(struct ceph_osd_request *req)
 
 static void submit_request(struct ceph_osd_request *req, bool wrlocked)
 {
-	ceph_osdc_get_request(req);
+	if (!req->r_replicated)
+		ceph_osdc_get_request(req);
 	account_request(req);
 	__submit_request(req, wrlocked);
 }
@@ -2474,15 +2508,32 @@ static void finish_request(struct ceph_osd_request *req)
 	ceph_msg_revoke_incoming(req->r_reply);
 }
 
+static void complete_and_put_request(struct ceph_osd_request *req)
+{
+	if (req->r_callback)
+		req->r_callback(req);
+	complete_all(&req->r_completion);
+
+	ceph_osdc_put_request(req);
+}
+
 static void __complete_request(struct ceph_osd_request *req)
 {
 	dout("%s req %p tid %llu cb %ps result %d\n", __func__, req,
 	     req->r_tid, req->r_callback, req->r_result);
 
-	if (req->r_callback)
-		req->r_callback(req);
-	complete_all(&req->r_completion);
-	ceph_osdc_put_request(req);
+	if (!req->r_replicated) {
+		complete_and_put_request(req);
+	} else {
+		struct ceph_osd_request *orig;
+
+		orig = req->r_orig ?: req;
+		if (req != orig)
+			complete_and_put_request(req);
+
+		if (refcount_dec_and_test(&orig->r_reps))
+			complete_and_put_request(orig);
+	}
 }
 
 static void complete_request_workfn(struct work_struct *work)
@@ -3182,7 +3233,7 @@ static void linger_submit(struct ceph_osd_linger_request *lreq)
 		lreq->reg_req->r_ops[0].notify.cookie = lreq->linger_id;
 	}
 
-	calc_target(osdc, &lreq->t, false);
+	calc_target(osdc, &lreq->t, false, false);
 	osd = lookup_create_osd(osdc, lreq->t.osd, true);
 	link_linger(osd, lreq);
 
@@ -3818,7 +3869,7 @@ recalc_linger_target(struct ceph_osd_linger_request *lreq)
 	struct ceph_osd_client *osdc = lreq->osdc;
 	enum calc_target_result ct_res;
 
-	ct_res = calc_target(osdc, &lreq->t, true);
+	ct_res = calc_target(osdc, &lreq->t, true, false);
 	if (ct_res == CALC_TARGET_NEED_RESEND) {
 		struct ceph_osd *osd;
 
@@ -3890,7 +3941,7 @@ static void scan_requests(struct ceph_osd *osd,
 		n = rb_next(n); /* unlink_request(), check_pool_dne() */
 
 		dout("%s req %p tid %llu\n", __func__, req, req->r_tid);
-		ct_res = calc_target(osdc, &req->r_t, false);
+		ct_res = calc_target(osdc, &req->r_t, false, req->r_replicated);
 		switch (ct_res) {
 		case CALC_TARGET_NO_ACTION:
 			force_resend_writes = cleared_full ||
@@ -3999,7 +4050,8 @@ static void kick_requests(struct ceph_osd_client *osdc,
 		n = rb_next(n);
 
 		if (req->r_t.epoch < osdc->osdmap->epoch) {
-			ct_res = calc_target(osdc, &req->r_t, false);
+			ct_res = calc_target(osdc, &req->r_t, false,
+					     req->r_replicated);
 			if (ct_res == CALC_TARGET_POOL_DNE) {
 				erase_request(need_resend, req);
 				check_pool_dne(req);
@@ -4558,6 +4610,163 @@ bad:
 	pr_err("osdc handle_watch_notify corrupt msg\n");
 }
 
+static void free_msg(struct ceph_msg *msg)
+{
+	int i;
+
+	/* Forget about data, don't release */
+	for (i = 0; i < msg->num_data_items; i++) {
+		msg->data[i].type = CEPH_MSG_DATA_NONE;
+	}
+}
+
+static struct ceph_osd_request *clone_request(struct ceph_osd_request *src)
+{
+	struct ceph_msg *request, *reply;
+	struct ceph_osd_request *cpy;
+	int i;
+
+	cpy = ceph_osdc_alloc_request(src->r_osdc, src->r_snapc,
+				      src->r_num_ops,
+				      src->r_mempool,
+				      GFP_NOIO);
+	BUG_ON(!cpy);
+
+
+	if (src->r_mempool) {
+		request = ceph_msgpool_get(&src->r_osdc->msgpool_op,
+					   src->r_request->front.iov_len,
+					   src->r_request->max_data_items);
+		reply = ceph_msgpool_get(&src->r_osdc->msgpool_op_reply,
+					 src->r_reply->front.iov_len,
+					 src->r_reply->max_data_items);
+
+	} else {
+		request = ceph_msg_new2(CEPH_MSG_OSD_OP,
+					src->r_request->front.iov_len,
+					src->r_request->max_data_items,
+					GFP_NOIO, true);
+		reply = ceph_msg_new2(CEPH_MSG_OSD_OPREPLY,
+				      src->r_reply->front.iov_len,
+				      src->r_reply->max_data_items,
+				      GFP_NOIO, true);
+	}
+	if (!request || !reply) {
+		if (request)
+			ceph_msg_put(request);
+		if (reply)
+			ceph_msg_put(reply);
+
+		ceph_osdc_put_request(cpy);
+
+		return NULL;
+	}
+
+	cpy->r_request = request;
+	cpy->r_reply = reply;
+
+	BUG_ON(cpy->r_request->front.iov_len !=
+	       src->r_request->front.iov_len);
+	BUG_ON(cpy->r_reply->front.iov_len !=
+	       src->r_reply->front.iov_len);
+
+	/* Copy ops */
+	memcpy(cpy->r_ops, src->r_ops, sizeof(*src->r_ops) * src->r_num_ops);
+
+	cpy->r_flags = src->r_flags;
+	cpy->r_start_stamp = src->r_start_stamp;
+	cpy->r_start_latency = src->r_start_latency;
+	cpy->r_mtime = src->r_mtime;
+	cpy->r_data_offset = src->r_data_offset;
+
+	ceph_oid_copy(&cpy->r_t.base_oid, &src->r_t.base_oid);
+	ceph_oloc_copy(&cpy->r_t.base_oloc, &src->r_t.base_oloc);
+	ceph_oid_copy(&cpy->r_t.target_oid, &src->r_t.target_oid);
+	ceph_oloc_copy(&cpy->r_t.target_oloc, &src->r_t.target_oloc);
+
+	cpy->r_request->free_msg = free_msg;
+	cpy->r_reply->free_msg = free_msg;
+
+	for (i = 0; i < src->r_request->num_data_items; i++) {
+		cpy->r_request->data[i] = src->r_request->data[i];
+		cpy->r_request->num_data_items++;
+	}
+
+	for (i = 0; i < src->r_reply->num_data_items; i++) {
+		cpy->r_reply->data[i] = src->r_reply->data[i];
+		cpy->r_reply->num_data_items++;
+	}
+
+	return cpy;
+}
+
+static void replicate_write_request(struct ceph_osd_client *osdc,
+				    struct ceph_osd_request *orig)
+{
+	struct ceph_osds acting = {};
+	int i;
+
+	WARN_ON(!osdmap_acting_osds(osdc, &orig->r_t, &acting));
+	BUG_ON(!acting.size);
+
+	/* Create requests to other OSDS */
+
+	refcount_set(&orig->r_reps, acting.size);
+
+	for (i = 0; i < acting.size - 1; i++) {
+		struct ceph_osd_request *req;
+
+		req = clone_request(orig);
+		BUG_ON(!req);
+
+		req->r_orig = orig;
+		req->r_replicated = true;
+		req->r_t.osd = acting.osds[i];
+		req->r_flags |= CEPH_OSD_FLAG_DONT_REPLICATE;
+
+		down_read(&osdc->lock);
+		submit_request(req, false);
+		up_read(&osdc->lock);
+	}
+	orig->r_replicated = true;
+	orig->r_t.osd = acting.osds[acting.size-1];
+	orig->r_flags |= CEPH_OSD_FLAG_DONT_REPLICATE;
+
+	down_read(&osdc->lock);
+	ceph_osdc_get_request(orig);
+	submit_request(orig, false);
+	up_read(&osdc->lock);
+}
+
+static bool can_replicate_request(struct ceph_osd_client *osdc,
+				  struct ceph_osd_request *req)
+{
+	struct ceph_osd_req_op *op;
+	int write_ops = 0, nr_ops;
+	int other_ops = 0;
+
+	if (!(osdc->client->options->flags & CEPH_OPT_CLIENT_BASED_REP))
+		return false;
+
+	if (CEPH_MSG_OSD_OP != le16_to_cpu(req->r_request->hdr.type))
+		return false;
+
+	for (op = req->r_ops; op != &req->r_ops[req->r_num_ops]; op++) {
+		if (op->op == CEPH_OSD_OP_WRITE ||
+		    op->op == CEPH_OSD_OP_WRITEFULL) {
+			write_ops++;
+		} else if (op->op == CEPH_OSD_OP_SETALLOCHINT) {
+			/* We include set-alloc-hint to write ops */
+			other_ops++;
+		}
+	}
+	nr_ops = write_ops + other_ops;
+	if (!write_ops || WARN_ON(req->r_num_ops != nr_ops))
+		return false;
+
+	return true;
+}
+
 /*
  * Register request, send initial attempt.
  */
@@ -4565,9 +4774,13 @@ int ceph_osdc_start_request(struct ceph_osd_client *osdc,
 			    struct ceph_osd_request *req,
 			    bool nofail)
 {
-	down_read(&osdc->lock);
-	submit_request(req, false);
-	up_read(&osdc->lock);
+	if (can_replicate_request(osdc, req)) {
+		replicate_write_request(osdc, req);
+	} else {
+		down_read(&osdc->lock);
+		submit_request(req, false);
+		up_read(&osdc->lock);
+	}
 
 	return 0;
 }

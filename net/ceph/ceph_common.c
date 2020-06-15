@@ -272,6 +272,7 @@ enum {
 	Opt_cephx_sign_messages,
 	Opt_tcp_nodelay,
 	Opt_abort_on_full,
+	Opt_client_based_replication,
 };
 
 enum {
@@ -289,6 +290,7 @@ static const struct constant_table ceph_param_read_from_replica[] = {
 
 static const struct fs_parameter_spec ceph_parameters[] = {
 	fsparam_flag	("abort_on_full",		Opt_abort_on_full),
+	fsparam_flag	("client_based_replication",	Opt_client_based_replication),
 	fsparam_flag_no ("cephx_require_signatures",	Opt_cephx_require_signatures),
 	fsparam_flag_no ("cephx_sign_messages",		Opt_cephx_sign_messages),
 	fsparam_flag_no ("crc",				Opt_crc),
@@ -571,6 +573,11 @@ int ceph_parse_param(struct fs_parameter *param, struct ceph_options *opt,
 		opt->flags |= CEPH_OPT_ABORT_ON_FULL;
 		break;
 
+	case Opt_client_based_replication:
+		opt->flags |= CEPH_OPT_CLIENT_BASED_REP;
+		break;
+
+
 	default:
 		BUG();
 	}
@@ -633,6 +640,8 @@ int ceph_print_client_options(struct seq_file *m, struct ceph_client *client,
 		seq_puts(m, "notcp_nodelay,");
 	if (show_all && (opt->flags & CEPH_OPT_ABORT_ON_FULL))
 		seq_puts(m, "abort_on_full,");
+	if (show_all && (opt->flags & CEPH_OPT_CLIENT_BASED_REP))
+		seq_puts(m, "client_based_replication,");
 
 	if (opt->mount_timeout != CEPH_MOUNT_TIMEOUT_DEFAULT)
 		seq_printf(m, "mount_timeout=%d,",

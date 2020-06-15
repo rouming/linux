@@ -183,6 +183,10 @@ struct ceph_osd_request {
 	struct work_struct r_complete_work;
 	struct ceph_osd *r_osd;
 
+	struct ceph_osd_request *r_orig;
+	refcount_t               r_reps;
+	bool                     r_replicated;
+
 	struct ceph_osd_request_target r_t;
 #define r_base_oid	r_t.base_oid
 #define r_base_oloc	r_t.base_oloc

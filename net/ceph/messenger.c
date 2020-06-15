@@ -3486,6 +3486,9 @@ static void ceph_msg_release(struct kref *kref)
 	dout("%s %p\n", __func__, m);
 	WARN_ON(!list_empty(&m->list_head));
 
+	if (m->free_msg)
+		m->free_msg(m);
+
 	msg_con_set(m, NULL);
 
 	/* drop middle, data, if any */
